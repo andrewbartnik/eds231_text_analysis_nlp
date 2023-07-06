@@ -1,0 +1,181 @@
+---
+title: 'Lab 3: Topic Analysis'
+output:
+  pdf_document: default
+  
+---
+
+### Assignment Lab 3:
+
+Due in 2 weeks: May 2 at 11:59PM
+
+For this assignment you'll the articles data you downloaded from Nexis Uni in Week 2.
+
+```{r, message=FALSE, warning=FALSE}
+library(quanteda)
+library(tm)
+library(topicmodels)
+library(ldatuning)
+library(tidyverse)
+library(tidytext)
+library(reshape2)
+library(LexisNexisTools)
+
+```
+
+```{r, message=FALSE, warning=FALSE}
+pre_files <- list.files(pattern = ".docx", 
+                        path = "~/Desktop/MEDS/Spring/text/text_analysis/lab2/files2",
+                       full.names = TRUE, 
+                       recursive = TRUE, 
+                       ignore.case = TRUE)
+
+
+pre_dat <- lnt_read(pre_files)
+
+meta <- pre_dat@meta
+articles <- pre_dat@articles
+paragraphs <- pre_dat@paragraphs
+```
+
+1.  Create a corpus from your articles.
+```{r, message=FALSE, warning=FALSE}
+corpus_bio <- corpus(x = articles, text_field = "Article")
+stories_stats <- summary(corpus_bio)
+head(stories_stats)
+```
+
+2.  Clean the data as appropriate.
+
+```{r, message=FALSE, warning=FALSE}
+toks2 <- tokens(corpus_bio, remove_punct = T, remove_numbers = T)
+add_stops <- stopwords("en")
+toks3 <- tokens_select(toks2, pattern = add_stops, selection = "remove")
+
+dfm_bio <- dfm(toks3, tolower = T)
+dfm <- dfm_trim(dfm_bio, min_docfreq = 2)
+
+head(dfm)
+
+sel_idx <- slam::row_sums(dfm)>0
+dfm <- dfm[sel_idx,]
+```
+
+
+3.  Run three models (i.e. with 3 values of k) and select the overall best value for k (the number of topics) - include some justification for your selection: theory, FindTopicsNumber() optimization metrics, interpretability, LDAvis. select the best single value for k.
+
+### K = 10
+```{r, message=FALSE, warning=FALSE}
+k <- 10
+
+topicModel_k10 <- LDA(dfm, 
+                     k, 
+                     method= "Gibbs", 
+                     control = list(iter = 500,
+                             verbose = 25))
+
+result <- posterior(topicModel_k10)
+attributes(result)
+
+beta <- result$terms
+theta <- result$topics
+vocab <- colnames(beta)
+
+dim(beta)
+dim(theta)
+terms(topicModel_k10, 10)
+```
+
+```{r, message=FALSE, warning=FALSE}
+result <- FindTopicsNumber(dfm, 
+                           topics = seq(from = 2, to = 20, by = 1), metrics = c("CaoJuan2009", "Deveaud2014"),
+                           method = "Gibbs",
+                           verbose = T)
+
+
+FindTopicsNumber_plot(result)
+```
+### K = 5
+```{r, message=FALSE, warning=FALSE}
+k <- 5
+
+topicModel_k5 <- LDA(dfm, 
+                     k, 
+                     method= "Gibbs", 
+                     control = list(iter = 500,
+                             verbose = 25))
+
+result <- posterior(topicModel_k10)
+attributes(result)
+
+beta <- result$terms
+theta <- result$topics
+vocab <- colnames(beta)
+
+dim(beta)
+dim(theta)
+terms(topicModel_k5, 10)
+```
+### K = 7
+```{r, message=FALSE, warning=FALSE}
+k <- 16
+
+topicModel_k7 <- LDA(dfm, 
+                     k, 
+                     method= "Gibbs", 
+                     control = list(iter = 500,
+                             verbose = 25))
+
+result <- posterior(topicModel_k10)
+attributes(result)
+
+beta <- result$terms
+theta <- result$topics
+vocab <- colnames(beta)
+
+dim(beta)
+dim(theta)
+terms(topicModel_k7, 10)
+```
+
+**Although the Findtopicsnumber() optimization metrics didn't suggest a consistent value for K, I decided to go with k =5 for interpretability. Running more topics resulted in more low-value words and worse interpretability between topics. ** 
+
+4. Plot the top terms in each topic and the distribution of topics across a sample of the documents (constrained by what looks good in the plot).
+```{r, message=FALSE, warning=FALSE}
+bio_topics <- tidy(topicModel_k5, matrix = "beta")
+
+top_terms <- bio_topics |> group_by(topic) |> top_n(10, beta) |> ungroup() |> arrange(topic, -beta)
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic, sep = "")) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free_y") +
+  scale_x_reordered()+
+  coord_flip()
+```
+
+```{r, message=FALSE, warning=FALSE}
+topic_words <- terms(topicModel_k10, 5)
+topic_names <- apply(topic_words, 2, paste, collapse = "")
+```
+
+```{r, message=FALSE, warning=FALSE}
+example_ids <- c(5:10)
+n <- length(example_ids)
+example_props <- theta[example_ids,]
+colnames(example_props) <- topic_names
+viz_df <- melt(cbind(data.frame(example_props),
+                     document = factor(1:n),
+                     variable.name = 'topic',
+                     id.vars = 'document'))
+viz_df
+ggplot(data = viz_df, aes(variable, value, fill = document), ylab = "proportion") +
+  geom_bar(stat="identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  coord_flip() +
+  facet_wrap(~ document, ncol = n)
+```
+
+
+5.  Take a stab at interpreting the resulting topics. What are the key themes discussed in the articles in your data base?
+**Based off the top terms in each topic, topic 1 seems to be most closely associated with different levels of government and their efforts to work on biodiversity projects. Topic 2 seems most closely associated with management and conservation, topic 3 seems to be associated with the theme of international climate change, topic 4 looks to be associated with risk and impact assessment for companies, and topic 5 seems to be associated with the theme of climate change's effect on natural ecosystems. K = 5 seems to have been a reasonable choice. **

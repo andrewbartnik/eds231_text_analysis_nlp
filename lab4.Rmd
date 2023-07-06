@@ -1,0 +1,310 @@
+---
+title: "Lab4"
+author: "Andrew Bartnik"
+date: "2023-05-02"
+output: html_document
+toc: true
+message: false
+warning: false
+---
+
+```{r packages, include = FALSE}
+library(tidytext)
+library(tidyverse)
+library(tidymodels)
+library(textrecipes)
+library(discrim) # naive-bayes
+library(vip)
+```
+
+This data set includes more possible predictors than the text alone, but for this model we will only use the text variable
+
+```{r data}
+
+urlfile ="https://raw.githubusercontent.com/MaRo406/EDS-231-text-sentiment/main/data/climbing_reports_model_dat.csv"
+incidents_df<-readr::read_csv(url(urlfile))
+```
+
+Now we'll split our data into training and test portions
+
+```{r split-data}
+set.seed(1234)
+incidents2class <- incidents_df %>%
+  mutate(fatal = factor(if_else(
+    is.na(Deadly) ,
+    "non-fatal", "fatal")))
+
+incidents_split <- initial_split(incidents2class, strata = fatal)
+
+incidents_train <- training(incidents_split)
+incidents_test <- testing(incidents_split)
+
+```
+
+We use recipe() to specify the predictor and outcome variables and the data.
+
+```{r recipe}
+incidents_rec <- recipe(fatal ~ Text, data = incidents_train)
+```
+
+Next we add some familiar pre-processing steps on our Text variable: tokenize to word level, filter to the most common words, and calculate tf-idf.
+
+```{r pre-process}
+recipe <- incidents_rec %>%
+  step_tokenize(Text) %>%
+  step_tokenfilter(Text, max_tokens = 1000) %>%
+  step_tfidf(Text) #new one from textrecipes
+```
+
+Create tidymodels workflow to combine the modeling components
+
+The advantages are: You don't have to keep track of separate objects in your workspace. The recipe prepping and model fitting can be executed using a single call to fit() . If you have custom tuning parameter settings, these can be defined using a simpler interface when combined with tune.
+
+```{r workflow}
+incidents_wf <- workflow() %>%
+  add_recipe(recipe)
+```
+
+```{r nb-spec}
+nb_spec <- naive_Bayes() %>%
+  set_mode("classification") %>% #set modeling context
+  set_engine("naivebayes") #method for fitting model
+
+nb_spec
+```
+
+Now we are ready to add our model to the workflow and fit it to the training data
+
+```{r fit-model}
+nb_fit <- incidents_wf %>%
+  add_model(nb_spec) %>%
+  fit(data = incidents_train)
+```
+
+Next up is model evaluation. We'll stretch our training data further and use resampling to evaluate our naive Bayes model. Here we create 10-fold cross-validation sets, and use them to estimate performance.
+
+```{r}
+set.seed(234)
+incidents_folds <- vfold_cv(incidents_train) #default is v = 10
+
+incidents_folds
+```
+
+```{r nb-workflow}
+nb_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(nb_spec)
+
+nb_wf
+```
+
+To estimate its performance, we fit the model many times, once to each of these resampled folds, and then evaluate on the heldout part of each resampled fold.
+
+```{r fit-resamples}
+nb_rs <- fit_resamples(
+  nb_wf,
+  incidents_folds,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+Extract the relevant information using collect_metrics() and collect_predictions() and examine the performance metrics.
+
+```{r}
+nb_rs_metrics <- collect_metrics(nb_rs)
+nb_rs_predictions <- collect_predictions(nb_rs)
+nb_rs_metrics
+```
+
+We'll use two performance metrics: accuracy and ROC AUC. Accuracy is the proportion of the data that is predicted correctly. The ROC curve plots the true positive rate against the false positive rate; AUC closer to 1 indicates a better-performing model, while AUC closer to 0.5 indicates a model that does no better than random guessing.
+
+```{r performance-plot}
+nb_rs_predictions %>%
+  group_by(id) %>%
+  roc_curve(truth = fatal, .pred_fatal) %>%
+  autoplot() +
+  labs(
+    "Resamples",
+    title = "ROC curve for Climbing Incident Reports"
+  )
+```
+
+Another model method involves the confusion matrix. A confusion matrix tabulates a model's false positives and false negatives for each class.
+
+```{r confusion-matrix}
+conf_mat_resampled(nb_rs, tidy = FALSE) %>% #compute matrix for each fold then average
+  autoplot(type = "heatmap")
+```
+
+```{r}
+lasso_spec <- logistic_reg(penalty = 0.01, mixture =1) |> 
+  set_mode('classification') |> 
+  set_engine("glmnet")
+
+lasso_wf <- workflow() |> 
+  add_recipe(recipe) |> 
+  add_model(lasso_spec)
+
+lasso_wf
+```
+
+```{r}
+set.seed(123)
+lasso_rs <- fit_resamples(
+  lasso_wf,
+  incidents_folds,
+  control = control_resamples(save_pred = T)
+)
+
+lasso_rs_metrics <- collect_metrics(lasso_rs)
+lasso_rs_predictions <- collect_predictions(lasso_rs)
+```
+
+```{r}
+lasso_rs_metrics
+```
+
+```{r}
+lasso_rs_predictions |> 
+  group_by(id) |> 
+  roc_curve(truth = fatal, .pred_fatal) |> 
+  autoplot() + labs(color = "Resamples",
+                    title = "ROC for Climbing Incident Reports")
+
+```
+
+```{r}
+tune_spec <- logistic_reg(penalty = tune(), mixture = 1) |> set_mode("classification") |> set_engine("glmnet")
+
+tune_spec
+```
+
+```{r}
+tune_wf <- workflow() |> 
+  add_recipe(recipe) |> 
+  add_model(tune_spec)
+
+set.seed(123)
+lambda_grid <- grid_regular(penalty(), levels = 30)
+tune_rs <- tune_grid(tune_wf, incidents_folds, grid = lambda_grid, control = control_resamples(save_pred = T))
+```
+
+```{r}
+collect_metrics(tune_rs)
+
+autoplot(tune_rs) + labs(title = "Lasso Performance Across Regular Penalties")
+```
+
+```{r}
+tune_rs |> show_best("roc_auc")
+
+tune_rs |> show_best("accuracy")
+```
+
+```{r}
+collect_metrics(tune_rs)
+chosen_acc <- tune_rs |> select_by_one_std_err(metric= "accuracy", -penalty)
+final_lasso <- finalize_workflow(tune_wf, chosen_acc)
+
+fitted_lasso <- fit(final_lasso, incidents_train)
+
+fitted_lasso |> extract_fit_parsnip() |> tidy() |> arrange(estimate)
+
+last_fit(final_lasso, incidents_split) |> collect_metrics()
+```
+
+```{r}
+fitted_lasso <- fit(final_lasso, incidents_train)
+
+fitted_lasso |> extract_fit_parsnip() |> tidy() |> arrange(estimate)
+
+last_fit(final_lasso, incidents_split) |> collect_metrics()
+```
+
+
+# Lab 4 Assignment: Due May 9 at 11:59pm
+
+1. Select another classification algorithm
+
+## Random Forest Classifier
+```{r}
+rf_spec <- rand_forest() |> set_mode("classification") |> set_engine("ranger")
+```
+
+
+2. Conduct an initial out-of-the-box model fit on the training data and prediction on the test test data.  Assess the performance of this initial model.
+```{r}
+rf_workflow <- workflow() |> add_recipe(recipe) |> add_model(rf_spec)
+rf_fit <- rf_workflow |> fit(data = incidents_train)
+
+rf_rs <- fit_resamples(
+  rf_workflow,
+  incidents_folds,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+```{r performance}
+rf_rs_metrics <- collect_metrics(rf_rs)
+nb_rs_predictions <- collect_predictions(rf_rs)
+rf_rs_metrics
+```
+**Initial model has an accuracy of 86% and roc_auc of 0.95. Not bad at all.**
+
+3. Select the relevant hyperparameters for your algorithm and tune your model.
+
+```{r}
+tune_rf_spec <- rand_forest(trees = tune(), mtry = tune(), min_n = tune()) |> set_mode("classification") |> set_engine("ranger")
+
+tune_rf_wf <- workflow() |> 
+  add_recipe(recipe) |> 
+  add_model(tune_rf_spec)
+
+set.seed(123)
+randf_grid <-grid_regular(trees(), min_n(), mtry(range(1:13)))
+doParallel::registerDoParallel()
+tune_rs <- tune_grid(tune_rf_wf, incidents_folds, grid = randf_grid, control = control_resamples(save_pred = T, parallel_over = 'everything'))
+```
+
+
+4. Conduct a model fit using your newly tuned model specification.  What are the terms most highly associated with non-fatal reports?  What about fatal reports? 
+```{r}
+params <- tune_rs |> show_best("accuracy") |> slice(1) |> select(trees, mtry, min_n)
+best_trees_rf <- params$trees
+best_mtry_rf <- params$mtry
+best_min_n_rf <- params$min_n
+
+randf_final <- rand_forest(
+  trees = best_trees_rf,
+  mtry = best_mtry_rf,
+  min_n = best_min_n_rf
+) |>
+  set_mode("classification") |>
+  set_engine("ranger")
+
+
+# fit on the training
+randf_final_fit <- tune_rf_wf |> 
+  update_model(randf_final) |> 
+  fit(data = incidents_train)
+```
+**Unfortunately tidy doesnt support ranger and we are unable to see variable importance/terms most highly associated with different reports**
+
+
+
+
+5. Predict fatality of the reports in the test set.  Compare this prediction performance to that of the Naive Bayes and Lasso models.  
+
+```{r}
+# predict on the test, calculate RMSE
+rf_testing_preds <- predict(randf_final_fit, incidents_test) |> 
+  bind_cols(incidents_test) |> 
+  mutate(truth = as.factor(fatal), estimate = as.factor(.pred_class)) |> 
+  metrics(truth = truth, estimate = estimate)
+
+rf_testing_preds
+
+```
+
+**Unfortunately, our predictions got worse as we tuned the model. This could be due to bad combinations chosen by the grid space, which is likely since our tuning grid isn't very big. Our random forest model also performs worse than the lasso model (which scored 92% accuracy), but slightly better than the Naive Bayes model (81% accuracy)**
+
